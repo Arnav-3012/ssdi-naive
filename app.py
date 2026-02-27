@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 # ----------------------------
 st.set_page_config(page_title="ML App: Descriptive Analysis + NB/LR", layout="wide")
 st.title("ML App: Descriptive Analysis + GaussianNB (Classification) / LinearRegression (Regression)")
-st.caption("Upload CSV → Descriptive Analysis (EDA) → choose problem type → select target/features → train/test split → evaluate.")
+st.caption("Upload CSV → Descriptive Analysis (EDA) → choose problem type/model → select target/features → train/test split → evaluate.")
 
 
 # ----------------------------
@@ -114,28 +114,162 @@ def min_class_count(y: pd.Series) -> int:
 
 
 # ----------------------------
-# Plot helpers (NO hist, NO box, NO heatmap)
+# Full Statistical Summary helpers
 # ----------------------------
-def plot_barh_series(s: pd.Series, title: str, xlabel: str):
-    fig = plt.figure()
-    s = s.sort_values()
-    s.plot(kind="barh")
-    plt.title(title)
-    plt.xlabel(xlabel)
+def numeric_summary(df: pd.DataFrame) -> pd.DataFrame:
+    num = df.select_dtypes(include=["number", "bool"])
+    if num.shape[1] == 0:
+        return pd.DataFrame()
+
+    out = num.describe().T  # count, mean, std, min, 25, 50, 75, max
+    out["missing"] = df[num.columns].isna().sum().values
+    out["missing_%"] = (out["missing"] / len(df) * 100).round(2)
+    out["unique"] = df[num.columns].nunique(dropna=True).values
+
+    safe_num = num.copy()
+    for c in safe_num.columns:
+        if pd.api.types.is_bool_dtype(safe_num[c]):
+            safe_num[c] = safe_num[c].astype(int)
+
+    out["skew"] = safe_num.skew(numeric_only=True).values
+    out["kurtosis"] = safe_num.kurtosis(numeric_only=True).values
+
+    out["cv"] = (out["std"] / out["mean"].replace(0, np.nan)).values
+    out["cv"] = out["cv"].replace([np.inf, -np.inf], np.nan)
+
+    return out.reset_index().rename(columns={"index": "column"})
+
+
+def categorical_summary(df: pd.DataFrame) -> pd.DataFrame:
+    cat = df.select_dtypes(include=["object", "category"])
+    if cat.shape[1] == 0:
+        return pd.DataFrame()
+
+    desc = cat.describe().T  # count, unique, top, freq
+    desc["missing"] = df[cat.columns].isna().sum().values
+    desc["missing_%"] = (desc["missing"] / len(df) * 100).round(2)
+    desc = desc.reset_index().rename(columns={"index": "column"})
+    return desc
+
+
+def top_cv_series(num_summary_df: pd.DataFrame, top_n: int = 10) -> pd.Series:
+    if num_summary_df.empty:
+        return pd.Series(dtype=float)
+    tmp = num_summary_df[["column", "cv"]].dropna().copy()
+    tmp = tmp.sort_values("cv", ascending=False).head(top_n)
+    return pd.Series(tmp["cv"].values, index=tmp["column"].values)
+
+
+def top_corr_with_target(df: pd.DataFrame, target_col: str, top_n: int = 10) -> pd.Series:
+    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    if target_col not in num_cols:
+        return pd.Series(dtype=float)
+
+    cols = [c for c in num_cols if c != target_col]
+    if not cols:
+        return pd.Series(dtype=float)
+
+    corr = df[cols + [target_col]].corr(numeric_only=True)[target_col].drop(target_col)
+    corr = corr.reindex(corr.abs().sort_values(ascending=False).head(top_n).index)
+    return corr
+
+
+# ----------------------------
+# Macro EDA Multi-Graph (ONE image)
+# (NO histogram, NO boxplot, NO heatmap)
+# ----------------------------
+def macro_eda_multigraph(df: pd.DataFrame, target_col: str, problem_type: str, top_n: int = 12):
+    dtype_counts = df.dtypes.astype(str).value_counts()
+
+    missing = df.isna().sum()
+    missing_top = missing[missing > 0].sort_values(ascending=False).head(top_n)
+
+    unique_top = df.nunique(dropna=True).sort_values(ascending=False).head(top_n)
+
+    num_sum = numeric_summary(df)
+    cv_series = top_cv_series(num_sum, top_n=min(10, top_n))
+
+    corr_series = pd.Series(dtype=float)
+    if problem_type == "Regression" and pd.api.types.is_numeric_dtype(df[target_col]):
+        corr_series = top_corr_with_target(df, target_col, top_n=min(10, top_n))
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    axes = axes.ravel()
+
+    # 1) dtype distribution
+    axes[0].bar(dtype_counts.index.astype(str), dtype_counts.values)
+    axes[0].set_title("Column Data Types Distribution")
+    axes[0].set_xlabel("dtype")
+    axes[0].set_ylabel("# columns")
+    axes[0].tick_params(axis="x", rotation=45)
+
+    # 2) Missing values
+    if len(missing_top) > 0:
+        s = missing_top.sort_values()
+        axes[1].barh(s.index.astype(str), s.values)
+        axes[1].set_title(f"Missing Values (Top {len(s)})")
+        axes[1].set_xlabel("missing count")
+    else:
+        axes[1].text(0.5, 0.5, "No missing values ✅", ha="center", va="center")
+        axes[1].axis("off")
+
+    # 3) Unique values
+    s = unique_top.sort_values()
+    axes[2].barh(s.index.astype(str), s.values)
+    axes[2].set_title(f"Unique Values (Top {len(s)})")
+    axes[2].set_xlabel("unique count")
+
+    # 4) CV (variability)
+    if len(cv_series) > 0:
+        axes[3].bar(cv_series.index.astype(str), cv_series.values)
+        axes[3].set_title("Highest Variability Features (Top CV)")
+        axes[3].set_ylabel("CV = std/mean")
+        axes[3].tick_params(axis="x", rotation=45)
+    else:
+        axes[3].text(0.5, 0.5, "No numeric CV available", ha="center", va="center")
+        axes[3].axis("off")
+
+    # 5) Target macro
+    if problem_type == "Classification":
+        vc = df[target_col].dropna().astype(str).value_counts().head(top_n)
+        axes[4].bar(vc.index.astype(str), vc.values)
+        axes[4].set_title(f"Target Class Counts (Top {len(vc)})")
+        axes[4].tick_params(axis="x", rotation=45)
+        axes[4].set_ylabel("count")
+    else:
+        if pd.api.types.is_numeric_dtype(df[target_col]):
+            y = df[target_col].dropna()
+            five = pd.Series({
+                "min": float(y.min()),
+                "Q1": float(y.quantile(0.25)),
+                "median": float(y.median()),
+                "Q3": float(y.quantile(0.75)),
+                "max": float(y.max()),
+            })
+            axes[4].bar(five.index.astype(str), five.values)
+            axes[4].set_title("Target 5-number Summary")
+            axes[4].set_ylabel("value")
+        else:
+            axes[4].text(0.5, 0.5, "Target not numeric", ha="center", va="center")
+            axes[4].axis("off")
+
+    # 6) Correlation with target (regression only)
+    if len(corr_series) > 0:
+        axes[5].bar(corr_series.index.astype(str), corr_series.values)
+        axes[5].set_title("Top Correlations with Target")
+        axes[5].set_ylabel("corr")
+        axes[5].tick_params(axis="x", rotation=45)
+    else:
+        axes[5].text(0.5, 0.5, "Correlation not applicable", ha="center", va="center")
+        axes[5].axis("off")
+
     plt.tight_layout()
     return fig
 
 
-def plot_bar_series(s: pd.Series, title: str, ylabel: str):
-    fig = plt.figure()
-    s.plot(kind="bar")
-    plt.title(title)
-    plt.ylabel(ylabel)
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    return fig
-
-
+# ----------------------------
+# Model plots
+# ----------------------------
 def plot_confusion(cm: np.ndarray, labels):
     fig = plt.figure()
     plt.imshow(cm, interpolation="nearest")
@@ -170,84 +304,6 @@ def plot_reg_scatter(y_true, y_pred):
 
 
 # ----------------------------
-# Descriptive Analysis (Full Statistical Summary)
-# ----------------------------
-def numeric_summary(df: pd.DataFrame) -> pd.DataFrame:
-    num = df.select_dtypes(include=["number", "bool"])
-    if num.shape[1] == 0:
-        return pd.DataFrame()
-
-    out = num.describe().T  # count, mean, std, min, 25, 50, 75, max
-    out["missing"] = df[num.columns].isna().sum().values
-    out["missing_%"] = (out["missing"] / len(df) * 100).round(2)
-    out["unique"] = df[num.columns].nunique(dropna=True).values
-
-    # extra stats
-    # avoid crash on bool columns for skew/kurt
-    safe_num = num.copy()
-    for c in safe_num.columns:
-        if pd.api.types.is_bool_dtype(safe_num[c]):
-            safe_num[c] = safe_num[c].astype(int)
-
-    out["skew"] = safe_num.skew(numeric_only=True).values
-    out["kurtosis"] = safe_num.kurtosis(numeric_only=True).values
-
-    # coefficient of variation = std/mean
-    out["cv"] = (out["std"] / out["mean"].replace(0, np.nan)).values
-    out["cv"] = out["cv"].replace([np.inf, -np.inf], np.nan)
-
-    return out.reset_index().rename(columns={"index": "column"})
-
-
-def categorical_summary(df: pd.DataFrame) -> pd.DataFrame:
-    cat = df.select_dtypes(include=["object", "category"])
-    if cat.shape[1] == 0:
-        return pd.DataFrame()
-
-    desc = cat.describe().T  # count, unique, top, freq
-    desc["missing"] = df[cat.columns].isna().sum().values
-    desc["missing_%"] = (desc["missing"] / len(df) * 100).round(2)
-    desc = desc.reset_index().rename(columns={"index": "column"})
-    return desc
-
-
-def top_missing_series(df: pd.DataFrame, top_n: int = 15) -> pd.Series:
-    missing = df.isna().sum()
-    missing = missing[missing > 0].sort_values(ascending=False).head(top_n)
-    return missing
-
-
-def dtype_distribution(df: pd.DataFrame) -> pd.Series:
-    return df.dtypes.astype(str).value_counts()
-
-
-def top_unique_series(df: pd.DataFrame, top_n: int = 15) -> pd.Series:
-    u = df.nunique(dropna=True).sort_values(ascending=False).head(top_n)
-    return u
-
-
-def top_cv_series(num_summary: pd.DataFrame, top_n: int = 10) -> pd.Series:
-    if num_summary.empty:
-        return pd.Series(dtype=float)
-    tmp = num_summary[["column", "cv"]].dropna().copy()
-    tmp = tmp.sort_values("cv", ascending=False).head(top_n)
-    return pd.Series(tmp["cv"].values, index=tmp["column"].values)
-
-
-def top_corr_with_target(df: pd.DataFrame, target_col: str, top_n: int = 10) -> pd.Series:
-    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    if target_col not in num_cols:
-        return pd.Series(dtype=float)
-    cols = [c for c in num_cols if c != target_col]
-    if not cols:
-        return pd.Series(dtype=float)
-
-    corr = df[cols + [target_col]].corr(numeric_only=True)[target_col].drop(target_col)
-    corr = corr.reindex(corr.abs().sort_values(ascending=False).head(top_n).index)
-    return corr
-
-
-# ----------------------------
 # Sidebar: Upload
 # ----------------------------
 st.sidebar.header("1) Upload Dataset (CSV)")
@@ -266,7 +322,7 @@ st.caption(f"Rows: {df.shape[0]} | Columns: {df.shape[1]}")
 
 
 # ----------------------------
-# Sidebar: Problem type + model (dropdown restored)
+# Sidebar: Problem type + model (dropdown back ✅)
 # ----------------------------
 st.sidebar.header("2) Problem Setup")
 problem_type = st.sidebar.selectbox("Problem type", ["Classification", "Regression"])
@@ -276,11 +332,14 @@ if problem_type == "Classification":
         "Choose model (classification)",
         ["Gaussian Naive Bayes (GaussianNB)"]
     )
+    model = GaussianNB()
 else:
     model_name = st.sidebar.selectbox(
         "Choose model (regression)",
         ["Linear Regression (LinearRegression)"]
     )
+    model = LinearRegression()
+
 
 # ----------------------------
 # Sidebar: Target + Features (filtered)
@@ -289,7 +348,11 @@ if df.shape[1] < 2:
     st.error("Dataset must have at least 2 columns.")
     st.stop()
 
-target_options = get_classification_targets(df, 20) if problem_type == "Classification" else get_regression_targets(df, 21)
+target_options = (
+    get_classification_targets(df, 20)
+    if problem_type == "Classification"
+    else get_regression_targets(df, 21)
+)
 
 if not target_options:
     st.error(
@@ -314,48 +377,18 @@ if not feature_cols:
 
 
 # ============================================================
-# ✅ NEW SECTION: Descriptive Analysis (FULL STATS + MULTI-GRAPH)
+# Descriptive Analysis Section (Macro Multi-Graph + Full Stats)
 # ============================================================
-st.markdown("## 📌 Descriptive Analysis (Full Statistical Summary + Multi-Graph EDA)")
+st.markdown("## 📌 Descriptive Analysis (Macro Multi-Graph + Full Statistical Summary)")
 
-tab_over, tab_stats, tab_target = st.tabs(
-    ["Multi-Graph Overview", "Full Statistical Summary", "Target Analysis"]
-)
+tab1, tab2 = st.tabs(["📈 Macro Multi-Graph (One Image)", "📋 Full Statistical Summary"])
 
-with tab_over:
-    left, right = st.columns(2)
+with tab1:
+    st.write("### Macro EDA Dashboard (all macro plots in ONE image)")
+    st.pyplot(macro_eda_multigraph(df, target_col=target_col, problem_type=problem_type, top_n=12))
+    st.caption("Macro EDA only (no histogram/boxplot/heatmap).")
 
-    with left:
-        st.write("### Column Data Types")
-        dt = dtype_distribution(df)
-        st.pyplot(plot_bar_series(dt, "Column Data Types Distribution", "num columns"))
-
-    with right:
-        st.write("### Missing Values (Top Columns)")
-        ms = top_missing_series(df, top_n=15)
-        if len(ms) > 0:
-            st.pyplot(plot_barh_series(ms, "Missing Values (Top 15)", "missing count"))
-        else:
-            st.success("No missing values ✅")
-
-    left2, right2 = st.columns(2)
-
-    with left2:
-        st.write("### Unique Values (Top Columns)")
-        uq = top_unique_series(df, top_n=15)
-        st.pyplot(plot_barh_series(uq, "Unique Values Count (Top 15)", "unique count"))
-
-    with right2:
-        st.write("### Numeric Spread (Top CV Columns)")
-        num_sum = numeric_summary(df)
-        cv = top_cv_series(num_sum, top_n=10)
-        if len(cv) > 0:
-            st.pyplot(plot_bar_series(cv, "Highest Variability Features (Top 10 CV)", "CV = std/mean"))
-            st.caption("Higher CV → feature varies a lot compared to its mean.")
-        else:
-            st.info("No numeric columns with valid CV found.")
-
-with tab_stats:
+with tab2:
     st.write("### Numeric Summary (Full)")
     num_sum = numeric_summary(df)
     if not num_sum.empty:
@@ -369,44 +402,6 @@ with tab_stats:
         st.dataframe(cat_sum, use_container_width=True)
     else:
         st.info("No categorical columns found.")
-
-with tab_target:
-    st.write("### Target Distribution / Summary")
-
-    if problem_type == "Classification":
-        y_tmp = df[target_col].dropna()
-        vc = y_tmp.value_counts(dropna=True).head(20)
-        st.pyplot(plot_bar_series(vc, f"Target Class Counts (Top 20): {target_col}", "count"))
-        st.caption("If you see too many unique classes (almost every row different), it’s NOT a good classification target.")
-
-    else:
-        # Regression target summary without histogram
-        if not pd.api.types.is_numeric_dtype(df[target_col]):
-            st.error("Regression target must be numeric.")
-        else:
-            y_tmp = df[target_col].dropna()
-
-            five = pd.Series({
-                "min": float(y_tmp.min()),
-                "Q1": float(y_tmp.quantile(0.25)),
-                "median": float(y_tmp.median()),
-                "Q3": float(y_tmp.quantile(0.75)),
-                "max": float(y_tmp.max()),
-            })
-            st.pyplot(plot_bar_series(five, f"Target 5-number Summary: {target_col}", "value"))
-
-            basic = pd.Series({
-                "mean": float(y_tmp.mean()),
-                "std": float(y_tmp.std()),
-            })
-            st.pyplot(plot_bar_series(basic, f"Target Mean & Std: {target_col}", "value"))
-
-            st.write("### Top Correlations with Target (Numeric features)")
-            corr = top_corr_with_target(df, target_col, top_n=10)
-            if len(corr) > 0:
-                st.pyplot(plot_bar_series(corr, "Top Correlations with Target (Top 10)", "corr"))
-            else:
-                st.info("Not enough numeric features (or target not numeric) to compute correlation.")
 
 
 # ----------------------------
@@ -482,7 +477,6 @@ preprocessor, numeric_cols, categorical_cols = build_preprocessor(
     df, feature_cols, do_impute=do_impute, do_scale=do_scale
 )
 
-model = GaussianNB() if problem_type == "Classification" else LinearRegression()
 pipe = Pipeline(steps=[("preprocess", preprocessor), ("model", model)])
 
 try:
@@ -501,7 +495,7 @@ st.markdown("## ✅ Model Results")
 
 with st.expander("Pipeline details"):
     st.write(f"**Problem type:** {problem_type}")
-    st.write(f"**Model:** {model_name}")
+    st.write(f"**Model selected:** {model_name}")
     st.write(f"**Numeric features:** {numeric_cols}")
     st.write(f"**Categorical features:** {categorical_cols}")
     st.write(f"**Imputation:** {'ON' if do_impute else 'OFF'}")
